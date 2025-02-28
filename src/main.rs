@@ -6,10 +6,11 @@ use std::{
 
 use axum::{routing::get, Json, Router};
 use lazy_static::lazy_static;
+use log::info;
 use rand::{rng, Rng};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 enum Status {
     OnCall,
     Available,
@@ -60,7 +61,7 @@ fn create_users() -> Vec<User> {
             id: 1,
             name: "Alice".to_string(),
             department: Department::Sales,
-            status: Status::OnCall,
+            status: Status::Available,
         },
         User {
             id: 2,
@@ -77,8 +78,8 @@ fn create_users() -> Vec<User> {
         User {
             id: 4,
             name: "David".to_string(),
-            department: Department::Audit,
-            status: Status::LoggedOut,
+            department: Department::Developer,
+            status: Status::Available,
         },
         User {
             id: 5,
@@ -110,6 +111,10 @@ async fn get_assigned_calls() -> Json<Vec<AssignedCall>> {
 
 #[tokio::main]
 async fn main() {
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .init();
+
     let create_server = tokio::spawn(async {
         let app = Router::new()
             .route("/", get(|| async { "Hello, World!" }))
@@ -117,7 +122,6 @@ async fn main() {
             .route("/get-calls", get(get_calls))
             .route("/get-assigned-calls", get(get_assigned_calls));
 
-        // run our app with hyper, listening globally on port 3000
         let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
         axum::serve(listener, app).await.unwrap();
     });
@@ -141,34 +145,29 @@ async fn main() {
             calls.push(new_call.clone());
         }
 
-        println!("New call generated: {:?}", new_call);
+        info!("New call generated: {:?}", new_call);
         thread::sleep(Duration::from_secs(2));
     });
 
     let assign_call = thread::spawn(|| loop {
         {
             let mut calls = CALL_DATA.write().unwrap();
-            let users = USER_DATA.read().unwrap();
+            let mut users = USER_DATA.write().unwrap();
             let mut assigned_calls = ASSIGNED_CALL_DATA.write().unwrap();
 
-            if let Some(call) = calls.first().cloned() {
-                if let Some(user) = users.iter().find(|u| u.department == call.department) {
-                    if let Status::Available = user.status {
-                        let assignment = AssignedCall {
-                            user_id: user.id,
-                            call_id: call.id,
-                        };
-                        assigned_calls.push(assignment.clone());
+            while let Some(call) = calls.pop() {
+                if let Some(user) = users
+                    .iter_mut()
+                    .find(|u| u.department == call.department && u.status == Status::Available)
+                {
+                    user.status = Status::OnCall;
+                    let assignment = AssignedCall {
+                        user_id: user.id,
+                        call_id: call.id,
+                    };
+                    assigned_calls.push(assignment);
 
-                        calls.retain(|c| c.id != call.id);
-
-                        println!("Assigned Call {} to User {}", call.id, user.name);
-                    }
-                } else {
-                    calls.remove(0);
-                    calls.push(call.clone());
-
-                    println!("No available user for Call {}. Moved to the end.", call.id);
+                    info!("Assigned Call {} to User {}", call.id, user.name)
                 }
             }
         }
@@ -176,7 +175,28 @@ async fn main() {
         thread::sleep(Duration::from_secs(2));
     });
 
+    let reset_status = thread::spawn(|| loop {
+        {
+            let mut users = USER_DATA.write().unwrap();
+            let assigned_calls = ASSIGNED_CALL_DATA.read().unwrap();
+
+            // Find users who are currently on a call
+            let assigned_user_ids: Vec<i32> = assigned_calls.iter().map(|ac| ac.user_id).collect();
+
+            for user in users.iter_mut() {
+                if assigned_user_ids.contains(&user.id) {
+                    // Simulate call completion by making the user available again
+                    user.status = Status::Available;
+                    info!("User {} is now available again", user.name)
+                }
+            }
+        }
+
+        thread::sleep(Duration::from_secs(10)); // Reset users every 5 seconds
+    });
+
     create_server.await.unwrap();
     create_call.join().unwrap();
     assign_call.join().unwrap();
+    reset_status.join().unwrap();
 }
